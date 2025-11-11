@@ -3,6 +3,7 @@ import json
 import base64
 import asyncio
 import websockets
+import aiohttp
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -21,17 +22,99 @@ TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
 SYSTEM_MESSAGE = (
-    "You are a helpful and bubbly AI assistant who loves to chat about "
-    "anything the user is interested in and is prepared to offer them facts. "
-    "You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. "
-    "Always stay positive, but work in a joke when appropriate."
+    "You are a helpful AI assistant for farmers in Bangladesh. You MUST speak in Bangla (Bengali) language. "
+    "You can help farmers with: checking their farm information, viewing market prices for crops, "
+    "adding products to their selling list, and removing products from their list. "
+    "When a farmer calls, you can look up their information using their phone number. "
+    "Always be polite, clear, and provide helpful agricultural advice in Bangla. "
+    "Use simple Bangla words that farmers can easily understand. Speak in a friendly and supportive tone."
 )
 VOICE = 'alloy'
+
+# Tool definitions - Add more tools here as needed
+TOOLS = [
+    {
+        "type": "function",
+        "name": "get_farmer_data",
+        "description": "Retrieves detailed information about a farmer including their name, farm details, crops, and contact information using their phone number.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "phone_number": {
+                    "type": "string",
+                    "description": "The farmer's phone number in international format (e.g., +8801788040850)"
+                }
+            },
+            "required": ["phone_number"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "get_market_prices",
+        "description": "Gets the latest market prices for crops including corn, mango, rice, and other agricultural products. Returns current market rates.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "type": "function",
+        "name": "add_product_to_selling_list",
+        "description": "Adds a new product to the farmer's selling list with product name, unit price, and unit type (kg, mon, quintal, ton).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "phone_number": {
+                    "type": "string",
+                    "description": "Farmer's phone number with country code (e.g., +8801788040850)"
+                },
+                "product_name": {
+                    "type": "string",
+                    "description": "Name of the product to sell (e.g., rice, wheat, corn)"
+                },
+                "unit_price": {
+                    "type": "number",
+                    "description": "Price per unit (must be non-negative)"
+                },
+                "unit": {
+                    "type": "string",
+                    "description": "Unit of measurement",
+                    "enum": ["kg", "mon", "quintal", "ton"]
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional description of the product (max 1000 characters)"
+                }
+            },
+            "required": ["phone_number", "product_name", "unit_price", "unit"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "delete_product_from_selling_list",
+        "description": "Removes a product from the farmer's selling list using the product ID.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "phone_number": {
+                    "type": "string",
+                    "description": "Farmer's phone number with country code (e.g., +8801788040850)"
+                },
+                "product_id": {
+                    "type": "string",
+                    "description": "The UUID of the product to delete"
+                }
+            },
+            "required": ["phone_number", "product_id"]
+        }
+    }
+]
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
     'input_audio_buffer.speech_stopped', 'input_audio_buffer.speech_started',
-    'session.created', 'session.updated'
+    'session.created', 'session.updated', 'response.function_call_arguments.done'
 ]
 SHOW_TIMING_MATH = False
 
@@ -43,6 +126,88 @@ class OutboundCallRequest(BaseModel):
 
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
+
+# Tool execution function
+async def execute_tool(function_name: str, arguments: dict):
+    """Execute the requested tool/function and return the result."""
+    print(f"Executing tool: {function_name} with arguments: {arguments}")
+    
+    if function_name == "get_farmer_data":
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://agrisense-z6ks.onrender.com/api/voice/get-farmer-data",
+                    json=arguments,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {"success": True, "data": data}
+                    else:
+                        error_text = await response.text()
+                        return {"success": False, "error": f"API returned status {response.status}: {error_text}"}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    elif function_name == "get_market_prices":
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://agrisense-z6ks.onrender.com/api/prices/public",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {"success": True, "data": data}
+                    else:
+                        error_text = await response.text()
+                        return {"success": False, "error": f"API returned status {response.status}: {error_text}"}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    elif function_name == "add_product_to_selling_list":
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://agrisense-z6ks.onrender.com/api/voice/add-product-by-phone",
+                    json=arguments,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {"success": True, "data": data, "message": "Product added successfully"}
+                    else:
+                        error_text = await response.text()
+                        return {"success": False, "error": f"API returned status {response.status}: {error_text}"}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    elif function_name == "delete_product_from_selling_list":
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://agrisense-z6ks.onrender.com/api/voice/delete-product-by-phone",
+                    json=arguments,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return {"success": True, "data": data, "message": "Product deleted successfully"}
+                    else:
+                        error_text = await response.text()
+                        return {"success": False, "error": f"API returned status {response.status}: {error_text}"}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "Request timed out"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    return {"success": False, "error": f"Unknown function: {function_name}"}
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -176,6 +341,34 @@ async def handle_media_stream(websocket: WebSocket):
                     if response['type'] in LOG_EVENT_TYPES:
                         print(f"Received event: {response['type']}", response)
 
+                    # Handle function calls
+                    if response.get('type') == 'response.function_call_arguments.done':
+                        print(f"Function call detected: {response}")
+                        function_name = response.get('name')
+                        call_id = response.get('call_id')
+                        try:
+                            arguments = json.loads(response.get('arguments', '{}'))
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        
+                        # Execute the tool
+                        result = await execute_tool(function_name, arguments)
+                        print(f"Tool result: {result}")
+                        
+                        # Send the result back to OpenAI
+                        function_output_event = {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": json.dumps(result)
+                            }
+                        }
+                        await openai_ws.send(json.dumps(function_output_event))
+                        
+                        # Trigger a new response from the assistant
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+
                     if response.get('type') == 'response.output_audio.delta' and 'delta' in response:
                         audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
                         audio_delta = {
@@ -285,6 +478,8 @@ async def initialize_session(openai_ws):
                 }
             },
             "instructions": SYSTEM_MESSAGE,
+            "tools": TOOLS,
+            "tool_choice": "auto"
         }
     }
     print('Sending session update:', json.dumps(session_update))
