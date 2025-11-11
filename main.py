@@ -7,12 +7,17 @@ from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
+from twilio.rest import Client
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
 SYSTEM_MESSAGE = (
@@ -32,12 +37,67 @@ SHOW_TIMING_MATH = False
 
 app = FastAPI()
 
+# Pydantic model for outbound call request
+class OutboundCallRequest(BaseModel):
+    phone_number: str
+
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
+
+@app.post("/make-call")
+async def make_outbound_call(request: Request, call_request: OutboundCallRequest):
+    """Initiate an outbound call to the specified phone number."""
+    try:
+        # Validate Twilio credentials
+        if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]):
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "error": "Twilio credentials not configured. Please set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER in .env file."
+                }
+            )
+        
+        # Initialize Twilio client
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        # Get the host from the request to build the callback URL
+        host = request.url.hostname
+        scheme = request.url.scheme
+        port = request.url.port
+        
+        # Build the base URL
+        if port and port not in [80, 443]:
+            base_url = f"{scheme}://{host}:{port}"
+        else:
+            base_url = f"{scheme}://{host}"
+        
+        # Make the outbound call
+        call = client.calls.create(
+            to=call_request.phone_number,
+            from_=TWILIO_PHONE_NUMBER,
+            url=f"{base_url}/incoming-call"
+        )
+        
+        return JSONResponse(
+            content={
+                "success": True,
+                "message": f"Call initiated to {call_request.phone_number}",
+                "call_sid": call.sid
+            }
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": str(e)
+            }
+        )
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
