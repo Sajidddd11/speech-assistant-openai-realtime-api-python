@@ -4,6 +4,7 @@ import base64
 import asyncio
 import websockets
 import aiohttp
+from typing import Optional
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -11,6 +12,7 @@ from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from twilio.rest import Client
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from urllib.parse import urlencode
 
 load_dotenv()
 
@@ -123,6 +125,7 @@ app = FastAPI()
 # Pydantic model for outbound call request
 class OutboundCallRequest(BaseModel):
     phone_number: str
+    reason: Optional[str] = None
 
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
@@ -241,11 +244,21 @@ async def make_outbound_call(request: Request, call_request: OutboundCallRequest
         else:
             base_url = f"{scheme}://{host}"
         
+        query_params = {}
+        if call_request.reason:
+            sanitized_reason = call_request.reason.strip()
+            if sanitized_reason:
+                query_params["reason"] = sanitized_reason[:250]
+
+        call_url = f"{base_url}/incoming-call"
+        if query_params:
+            call_url = f"{call_url}?{urlencode(query_params)}"
+
         # Make the outbound call
         call = client.calls.create(
             to=call_request.phone_number,
             from_=TWILIO_PHONE_NUMBER,
-            url=f"{base_url}/incoming-call"
+            url=call_url
         )
         
         return JSONResponse(
@@ -268,6 +281,10 @@ async def make_outbound_call(request: Request, call_request: OutboundCallRequest
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
+    call_reason = request.query_params.get('reason')
+    if call_reason:
+        call_reason = call_reason[:250]
+
     # <Say> punctuation to improve text-to-speech flow
     response.say(
         "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API",
@@ -280,7 +297,10 @@ async def handle_incoming_call(request: Request):
     )
     host = request.url.hostname
     connect = Connect()
-    connect.stream(url=f'wss://{host}/media-stream')
+    stream = Stream(url=f'wss://{host}/media-stream')
+    if call_reason:
+        stream.parameter(name="reason", value=call_reason)
+    connect.append(stream)
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -304,6 +324,52 @@ async def handle_media_stream(websocket: WebSocket):
         last_assistant_item = None
         mark_queue = []
         response_start_timestamp_twilio = None
+        call_reason = None
+        reason_applied = False
+
+        async def apply_call_reason(reason_value: str):
+            nonlocal call_reason, reason_applied
+            if reason_applied:
+                return
+
+            sanitized_reason = (reason_value or "").strip()
+            if not sanitized_reason:
+                return
+
+            reason_applied = True
+            call_reason = sanitized_reason[:250]
+
+            combined_instructions = (
+                f"{SYSTEM_MESSAGE}\n\n"
+                f"The farmer is being contacted for the following reason: {call_reason}. "
+                "Begin by greeting them warmly in Bangla and clearly stating this reason before offering additional help."
+            )
+
+            session_update_event = {
+                "type": "session.update",
+                "session": {
+                    "instructions": combined_instructions
+                }
+            }
+            await openai_ws.send(json.dumps(session_update_event))
+
+            reason_message_event = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                f"Call reason: {call_reason}. Greet the farmer in Bangla and clearly explain this reason before offering more help."
+                            )
+                        }
+                    ]
+                }
+            }
+            await openai_ws.send(json.dumps(reason_message_event))
+            await openai_ws.send(json.dumps({"type": "response.create"}))
         
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
@@ -324,6 +390,11 @@ async def handle_media_stream(websocket: WebSocket):
                         response_start_timestamp_twilio = None
                         latest_media_timestamp = 0
                         last_assistant_item = None
+                        params = data['start'].get('customParameters', {})
+                        if isinstance(params, dict):
+                            potential_reason = params.get('reason')
+                            if potential_reason:
+                                await apply_call_reason(potential_reason)
                     elif data['event'] == 'mark':
                         if mark_queue:
                             mark_queue.pop(0)
