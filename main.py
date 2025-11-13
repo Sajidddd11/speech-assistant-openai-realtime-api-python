@@ -24,10 +24,11 @@ TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
 SYSTEM_MESSAGE = (
-    "You are a helpful AI assistant for farmers in Bangladesh. You MUST speak in Bangla (Bengali) language. "
+    "You are a helpful AI assistant for farmers in Bangladesh. You MUST speak in Bangla (Bengali) language. and greet those with Salam "
     "You can help farmers with: checking their farm information, viewing market prices for crops, "
     "adding products to their selling list, and removing products from their list. "
     "When a farmer calls, you can look up their information using their phone number. "
+    "Here will you get what he is cultivating, land size, location, sensor data, what he is selling, weather data and satelite data. so analyzing all give him best suggestion suitable to him. consider all factors. suppose if moisture is low check is there chance to rain. if yes then tell him to wait if possible for his crop. if not then tell him to irrigate. try to tell natural remedies to solve his problem if possible if not then go for actual chemicals. "
     "Always be polite, clear, and provide helpful agricultural advice in Bangla. "
     "Use simple Bangla words that farmers can easily understand. Speak in a friendly and supportive tone."
 )
@@ -287,7 +288,7 @@ async def handle_incoming_call(request: Request):
 
     # <Say> punctuation to improve text-to-speech flow
     response.say(
-        "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API",
+        "Connected to agrisense voice assistant",
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
     response.pause(length=1)
@@ -521,7 +522,7 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?'"
+                    "text": "Greet the user with 'Hello there! I am an AI voice assistant from agrisense. You can ask me for you farming support'"
                 }
             ]
         }
