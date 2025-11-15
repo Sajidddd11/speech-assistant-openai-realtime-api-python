@@ -12,7 +12,7 @@ from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from twilio.rest import Client
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 load_dotenv()
 
@@ -23,6 +23,9 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 PORT = int(os.getenv('PORT', 5050))
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
+# Public URL that Twilio can reach (required for outbound calls)
+# Example: https://your-domain.com or https://your-ngrok-url.ngrok.io
+PUBLIC_URL = os.getenv('PUBLIC_URL', '').rstrip('/')
 SYSTEM_MESSAGE = (
     "You are a helpful AI assistant for farmers in Bangladesh. You MUST speak in Bangla (Bengali) language. You have the callers number already so dont ask him about it"
     "You can help farmers with: checking their farm information, viewing market prices for crops, "
@@ -213,6 +216,33 @@ async def execute_tool(function_name: str, arguments: dict):
     
     return {"success": False, "error": f"Unknown function: {function_name}"}
 
+def get_public_hostname(request: Request) -> tuple[str, int | None]:
+    """Get the public hostname from request, checking headers for reverse proxy."""
+    # Priority 1: Use PUBLIC_URL if set
+    if PUBLIC_URL:
+        parsed = urlparse(PUBLIC_URL)
+        return parsed.hostname, parsed.port
+    
+    # Priority 2: Check X-Forwarded-Host header (reverse proxy)
+    forwarded_host = request.headers.get("X-Forwarded-Host")
+    if forwarded_host:
+        # Remove port if present in header
+        host_parts = forwarded_host.split(":")
+        host = host_parts[0]
+        port = int(host_parts[1]) if len(host_parts) > 1 else None
+        return host, port
+    
+    # Priority 3: Check Host header
+    host_header = request.headers.get("Host")
+    if host_header:
+        host_parts = host_header.split(":")
+        host = host_parts[0]
+        port = int(host_parts[1]) if len(host_parts) > 1 else None
+        return host, port
+    
+    # Priority 4: Fallback to request.url
+    return request.url.hostname, request.url.port
+
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
@@ -234,16 +264,29 @@ async def make_outbound_call(request: Request, call_request: OutboundCallRequest
         # Initialize Twilio client
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         
-        # Get the host from the request to build the callback URL
-        host = request.url.hostname
-        scheme = request.url.scheme
-        port = request.url.port
+        # Get the public hostname (same logic as incoming-call)
+        host, port = get_public_hostname(request)
+        
+        # Determine scheme (use https for public URLs, http for localhost)
+        if PUBLIC_URL:
+            scheme = "https" if PUBLIC_URL.startswith("https") else "http"
+        else:
+            scheme = request.url.scheme
         
         # Build the base URL
         if port and port not in [80, 443]:
             base_url = f"{scheme}://{host}:{port}"
         else:
             base_url = f"{scheme}://{host}"
+        
+        # Log for debugging
+        print(f"📞 Making outbound call to {call_request.phone_number}")
+        print(f"   Callback URL will be: {base_url}/incoming-call")
+        
+        # Warn if using localhost/internal IP (Twilio can't reach it)
+        if host in ['localhost', '127.0.0.1'] or (host and (host.startswith('192.168.') or host.startswith('10.'))):
+            print(f"⚠️  WARNING: Using {base_url} for Twilio callback. This may fail for outbound calls!")
+            print("   Set PUBLIC_URL in .env to your public URL (e.g., https://your-domain.com or ngrok URL)")
         
         query_params = {}
         if call_request.reason:
@@ -296,9 +339,25 @@ async def handle_incoming_call(request: Request):
         "O.K. you can start talking!",
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
-    host = request.url.hostname
+    
+    # Build WebSocket URL - use PUBLIC_URL if set, otherwise try to detect from request
+    ws_host, ws_port = get_public_hostname(request)
+    
+    # Log detected hostname for debugging
+    print(f"🔍 Detected hostname: {ws_host}:{ws_port} (from {'PUBLIC_URL' if PUBLIC_URL else 'request headers'})")
+    print(f"   Request URL: {request.url}")
+    print(f"   Host header: {request.headers.get('Host')}")
+    print(f"   X-Forwarded-Host: {request.headers.get('X-Forwarded-Host')}")
+    
+    if ws_port and ws_port not in [80, 443]:
+        ws_url = f"wss://{ws_host}:{ws_port}/media-stream"
+    else:
+        ws_url = f"wss://{ws_host}/media-stream"
+    
+    print(f"   WebSocket URL: {ws_url}")
+    
     connect = Connect()
-    stream = Stream(url=f'wss://{host}/media-stream')
+    stream = Stream(url=ws_url)
     if call_reason:
         stream.parameter(name="reason", value=call_reason)
     connect.append(stream)
